@@ -16,8 +16,6 @@ let tokenToSymbol = {};
 const currentMinuteData = {};
 const rsiActive = {};
 
-
-
 /**
  * Returns formatted date (YYYY-MM-DD HH:mm:00).
  */
@@ -89,7 +87,7 @@ async function initializeRsiWithHistoricalData(kc, tokens, period = 14) {
         };
         tokenRSI[token] = rsi;
 
-      //  console.log(`✅ RSI initialized for ${tokenToSymbol[token]} (${token}) -> ${rsi.toFixed(2)}`);
+        console.log(`✅ RSI initialized for ${tokenToSymbol[token]} (${token}) -> ${rsi.toFixed(2)}`);
       }
     } catch (e) {
       console.error(`Error initializing RSI for ${token}: ${e.message}`);
@@ -134,145 +132,75 @@ function finalizeRsiForToken(token, data) {
 
   tokenRSI[token] = newRsi;
 
-  //console.log(`✅ Final RSI for ${tokenToSymbol[token]} (${token}): ${newRsi.toFixed(2)}`);
+  console.log(`✅ Final RSI for ${tokenToSymbol[token]} (${token}): ${newRsi.toFixed(2)}`);
 }
 
 /**
  * Placeholder for actual order placement.
  */
-/**
- * Place or Exit an Order.
- * 
- * 1. If an open position for the token is found:
- *    - Check if target price is met -> Exit the position.
- * 2. If no open position:
- *    - Validate RSI and bullish/bearish scan constraints.
- *    - Place a new entry order.
- */
-/**
- * Place an entry order if no position.
- * Place an exit order if position already exists.
- */
-/**
- * Place order based on RSI and bullish/bearish sets.
- * Quantity = 1, Target Profit = +/- 3
- */
-const entryPlaced = {};
-const exitPlaced = {};
-async function placeOrder(token, rsi, kc, tokenCloses) {
-  const symbol = tokenToSymbol[token];
-  if (!symbol) return;
+async function placeOrder(token, rsi, kc, tokenCloses, orderType = "BUY") {
+  if (orderType === "BUY" && !bullishScanSet.has(tokenToSymbol[token])) return;
+  if (orderType === "SELL" && !bearishScanSet.has(tokenToSymbol[token])) return;
+  if (orderInProgress) return;
+  if (orderType === "BUY" && rsi <= 67) return;
+  if (orderType === "SELL" && rsi >= 36) return;
 
-  // ✅ Decide orderType based on RSI and scan sets
-  let orderType = null;
-  if (bullishScanSet.has(symbol) && rsi >= 67 && rsi <= 70) {
-    orderType = "BUY";
-  } else if (bearishScanSet.has(symbol) && rsi <= 36 && rsi >= 30) {
-    orderType = "SELL";
-  }
+  orderInProgress = true;
 
-  // ✅ No signal, skip
-  if (!orderType) return;
+  try {
+    const positionsResp = await kc.getPositions();
+    const intradayPositions = positionsResp.net.filter(
+      pos => pos.product === "MIS" && pos.quantity !== 0
+    );
+    const tradingsymbol = tokenToSymbol[token];
+    const hasOpenPosition = intradayPositions.some(
+      pos => pos.tradingsymbol === tradingsymbol && pos.exchange === "NSE"
+    );
+    if (hasOpenPosition) {
+      orderInProgress = false;
+      return;
+    }
 
-  const entryKey = `${token}_${orderType}`;
-  const exitKey = `${token}_${orderType}`;
+    const funds = await kc.getMargins();
+    const available = funds.equity.available.cash;
+    const lastClose = tokenCloses[token]?.slice(-1)[0]?.close;
 
-  // ✅ Check for any open MIS position (across all tokens)
-  const positionsResp = await kc.getPositions();
-  const intradayPositions = positionsResp.net.filter(pos => pos.product === "MIS" && pos.quantity !== 0);
+    if (!lastClose || available < lastClose) {
+      orderInProgress = false;
+      return;
+    }
 
-  // If there are open positions, only place exit order for this token if needed, do not place new entry order
-  const openPos = intradayPositions.find(pos => pos.tradingsymbol === symbol && pos.exchange === "NSE");
-  if (intradayPositions.length > 0) {
-    // If there is any open position, do NOT place a new entry order for any token
-    // Only place exit order for this token if needed and not already placed
-    if (openPos && !exitPlaced[exitKey]) {
-      const qty = Math.abs(openPos.quantity);
-      const lastClose = openPos.last_price || openPos.average_price;
-      if (!lastClose) return;
-      let exitPrice;
-      if (openPos.quantity > 0) {
-        // Long position, exit with SELL
-        exitPrice = Math.round((lastClose + 3) * 100) / 100;
-      } else {
-        // Short position, exit with BUY
-        exitPrice = Math.round((lastClose - 3) * 100) / 100;
-      }
-      
+    const buyingPower = available * 4.8;
+    let quantity = Math.floor(buyingPower / lastClose);
+    if (quantity < 1) {
+      orderInProgress = false;
+      return;
+    }
+
+    let exitPrice;
+    if (orderType === "BUY") {
+      exitPrice = lastClose + (6000 / quantity);
+    } else {
+      exitPrice = lastClose - (6000 / quantity);
+    }
+    exitPrice = Math.round(exitPrice * 100) / 100;
+
+    const entryOrder = await kc.placeOrder("regular", {
+      exchange: "NSE",
+      tradingsymbol,
+      transaction_type: orderType,
+      quantity,
+      order_type: "MARKET",
+      product: "MIS",
+      variety: "regular",
+    });
+    lastOrderToken = token;
+
+    setTimeout(async () => {
       try {
         await kc.placeOrder("regular", {
-          exchange: openPos.exchange,
-          tradingsymbol: openPos.tradingsymbol,
-          transaction_type: openPos.quantity > 0 ? "SELL" : "BUY",
-          quantity: qty,
-          order_type: "LIMIT",
-          price: exitPrice,
-          product: "MIS",
-          variety: "regular",
-        });
-        exitPlaced[exitKey] = true;
-        console.log(`🎯 Exit order placed for ${symbol}, quantity ${qty}, target price ${exitPrice}`);
-      } catch (exitErr) {
-        console.error(`❌ Error placing exit order for ${symbol}: ${exitErr.message}`);
-      }
-    }
-    // Do not place any new entry order while any MIS position is open
-    return;
-  }
-
-  // ✅ Reset flags if position is closed
-  entryPlaced[entryKey] = false;
-  exitPlaced[exitKey] = false;
-
-  // ✅ Skip if already placed
-  if (entryPlaced[entryKey]) return;
-
-  // ✅ Begin placing order
-  if (!orderInProgress) {
-    orderInProgress = true;
-
-    try {
-      const available = (await kc.getMargins()).equity.available.cash;
-      const lastClose = tokenCloses[token]?.slice(-1)[0]?.close;
-
-      if (!lastClose || available < lastClose) {
-        orderInProgress = false;
-        return;
-      }
-
-      // ✅ Quantity and Target Profit
-      const quantity = 1;
-      const exitPrice = orderType === "BUY"
-        ? Math.round((lastClose + 3) * 100) / 100
-        : Math.round((lastClose - 3) * 100) / 100;
-
-      // ✅ Place Entry Order
-      await kc.placeOrder("regular", {
-        exchange: "NSE",
-        tradingsymbol: symbol,
-        transaction_type: orderType,
-        quantity,
-        order_type: "MARKET",
-        product: "MIS",
-        variety: "regular",
-      });
-      entryPlaced[entryKey] = true;
-
-      // Mark token as bought for UI highlight
-      global.boughtTokens = global.boughtTokens || {};
-      if (orderType === "BUY") {
-        global.boughtTokens[token] = true;
-      } else if (orderType === "SELL") {
-        global.boughtTokens[token] = false;
-      }
-
-      console.log(`✅ ${orderType} order placed for ${symbol}, quantity ${quantity}, entry price ${lastClose}`);
-
-      // ✅ Place Exit Order only if not already placed
-      if (!exitPlaced[exitKey]) {
-        await kc.placeOrder("regular", {
           exchange: "NSE",
-          tradingsymbol: symbol,
+          tradingsymbol,
           transaction_type: orderType === "BUY" ? "SELL" : "BUY",
           quantity,
           order_type: "LIMIT",
@@ -280,20 +208,16 @@ async function placeOrder(token, rsi, kc, tokenCloses) {
           product: "MIS",
           variety: "regular",
         });
-        exitPlaced[exitKey] = true;
-        console.log(`🎯 Exit order placed for ${symbol}, quantity ${quantity}, target price ${exitPrice}`);
+        console.log(`Placed target exit order for ${tradingsymbol} at price ${exitPrice} for qty ${quantity}`);
+      } catch (exitErr) {
+        console.error("❌ Error placing target exit order:", exitErr.message);
       }
-    } catch (err) {
-      console.error(`❌ Error placing ${orderType} order for ${symbol}: ${err.message}`);
-    } finally {
-      orderInProgress = false;
-    }
+    }, 2000);
+  } catch (err) {
+    console.error("❌ Error placing order:", err.message);
   }
+  orderInProgress = false;
 }
-
-
-
-
 
 /**
  * Main setup for Ticker.
@@ -320,10 +244,7 @@ async function setupTickerWithFiltered(filtered, apiKey, accessToken, kc) {
 
   if (ticker) {
     try {
-      // Fix: Only call removeAllListeners if it exists (KiteTicker >= 4.x)
-      if (typeof ticker.removeAllListeners === "function") {
-        ticker.removeAllListeners();
-      }
+      ticker.removeAllListeners();
       ticker.disconnect();
     } catch (err) {
       console.warn("Ticker cleanup error:", err.message);
@@ -333,7 +254,7 @@ async function setupTickerWithFiltered(filtered, apiKey, accessToken, kc) {
 
   ticker = new KiteTicker({ api_key: apiKey, access_token: accessToken });
   streamingTokens = tokens;
-  setupTickerHandlers.kc = () => kc;
+
   setupTickerHandlers();
   setImmediate(() => ticker.connect());
 }
@@ -399,47 +320,16 @@ function setupTickerHandlers() {
 
         const rsLive = avgLossLive === 0 ? 0 : avgGainLive / avgLossLive;
         const rsiLive = avgLossLive === 0 ? 100 : 100 - (100 / (1 + rsLive));
-
-        tokenRSI[token] = rsiLive;
-
-        // ✅ DECISION: Call only one placeOrder
-        if (typeof setupTickerHandlers.kc === "function") {
-          const kcInstance = setupTickerHandlers.kc();
-          
-         // if (rsiLive > 67) {
-            placeOrder(token, rsiLive, kcInstance, tokenCloses);
-         // } else if (rsiLive < 36) {
-          //  placeOrder(token, rsiLive, kcInstance, tokenCloses, "SELL");
-         // }
+        if(token == '1401601'){
+          console.log(`Live RSI for ${tokenToSymbol[token]} (${token}): ${rsiLive.toFixed(2)}`);
         }
-
-        // 👉 Send RSI data to WS listeners as before
-        if (typeof global.rsiTickListeners === "undefined") global.rsiTickListeners = [];
-        if (global.rsiTickListeners.length > 0) {
-          const lastFilteredMap = (lastFiltered || []).reduce((acc, inst) => {
-            acc[inst.instrument_token] = inst;
-            return acc;
-          }, {});
-          const rsiData = Object.keys(tokenRSI).map(tokenKey => {
-            const inst = lastFilteredMap[tokenKey];
-            let tradingsymbol = inst ? inst.tradingsymbol : tokenKey;
-            let name = inst ? inst.name : tradingsymbol;
-            const closes = inst && inst.instrument_token && tokenCloses[inst.instrument_token]?.map(c => c.close) || [];
-            return {
-              instrument_token: tokenKey,
-              tradingsymbol,
-              name,
-              close: closes.length ? closes[closes.length - 1] : null,
-              rsi: tokenRSI[tokenKey] ?? null
-            };
-          });
-          global.rsiTickListeners.forEach(fn => fn(rsiData));
-        }
+        // console.log(
+        //   `📈 Live RSI for ${tokenToSymbol[token]} (${token}): ${rsiLive.toFixed(2)}`
+        // );
       }
     }
   });
 });
-
 
 
   ticker.on("error", (err) => {
@@ -449,12 +339,6 @@ function setupTickerHandlers() {
       console.warn("Ticker warning:", err.message);
     }
   });
-}
-
-// Add this at the end of the file to allow WS to register listeners
-function onRsiTickUpdate(listener) {
-  if (typeof global.rsiTickListeners === "undefined") global.rsiTickListeners = [];
-  global.rsiTickListeners.push(listener);
 }
 
 module.exports = {
@@ -467,5 +351,4 @@ module.exports = {
   lastFiltered,
   bullishScanSet,
   bearishScanSet,
-  onRsiTickUpdate
 };
