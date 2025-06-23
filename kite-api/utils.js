@@ -71,9 +71,35 @@ function calculateRSI(closes, period = 14) {
   return 100 - (100 / (1 + rs));
 }
 
+function getLatestBearishScanFile() {
+  const files = fs.readdirSync(__dirname)
+    .filter(f => /^bearish scan_ScanResults.*\.csv$/i.test(f))
+    .map(f => ({ name: f, time: fs.statSync(path.join(__dirname, f)).mtime.getTime() }))
+    .sort((a, b) => b.time - a.time);
+  return files.length > 0 ? path.join(__dirname, files[0].name) : null;
+}
+
+function loadBearishScanSymbols() {
+  return new Promise((resolve, reject) => {
+    const latestFile = getLatestBearishScanFile();
+    if (!latestFile) return resolve(new Set());
+    const symbols = new Set();
+    fs.createReadStream(latestFile)
+      .pipe(csv())
+      .on("data", (row) => {
+        if (row.Symbol) {
+          symbols.add(row.Symbol.trim().toUpperCase());
+        }
+      })
+      .on("end", () => resolve(symbols))
+      .on("error", reject);
+  });
+}
+
 module.exports = {
   loadNifty500Symbols,
   getLatestBullishScanFile,
   loadBullishScanSymbols,
   calculateRSI,
+  loadBearishScanSymbols,
 };
